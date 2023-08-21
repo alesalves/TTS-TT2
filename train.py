@@ -15,7 +15,15 @@ from data_utils import TextMelLoader, TextMelCollate
 from loss_function import Tacotron2Loss
 from logger import Tacotron2Logger
 from hparams import create_hparams
+from tqdm import tqdm
 
+from plotting_utils import plot_alignment_to_numpy
+from IPython import display
+from PIL import Image
+
+def plot_something_to_ipython(alignment):
+  numpoop = plot_alignment_to_numpy(alignment)
+  display.display(Image.fromarray(numpoop))
 
 def reduce_tensor(tensor, n_gpus):
     rt = tensor.clone()
@@ -25,8 +33,8 @@ def reduce_tensor(tensor, n_gpus):
 
 
 def init_distributed(hparams, n_gpus, rank, group_name):
-    assert torch.cuda.is_available(), "Distributed mode requires CUDA."
-    print("Initializing Distributed")
+    assert torch.cuda.is_available(), "distributed mode requires CUDA"
+    print("initializing distributed")
 
     # Set cuda device so everything is done on the right GPU.
     torch.cuda.set_device(rank % torch.cuda.device_count())
@@ -36,7 +44,7 @@ def init_distributed(hparams, n_gpus, rank, group_name):
         backend=hparams.dist_backend, init_method=hparams.dist_url,
         world_size=n_gpus, rank=rank, group_name=group_name)
 
-    print("Done initializing distributed")
+    print("done initializing distributed")
 
 
 def prepare_dataloaders(hparams):
@@ -83,7 +91,7 @@ def load_model(hparams):
 
 def warm_start_model(checkpoint_path, model, ignore_layers):
     assert os.path.isfile(checkpoint_path)
-    print("Warm starting model from checkpoint '{}'".format(checkpoint_path))
+    print("warm starting model from checkpoint '{}'".format(checkpoint_path))
     checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
     model_dict = checkpoint_dict['state_dict']
     if len(ignore_layers) > 0:
@@ -98,19 +106,19 @@ def warm_start_model(checkpoint_path, model, ignore_layers):
 
 def load_checkpoint(checkpoint_path, model, optimizer):
     assert os.path.isfile(checkpoint_path)
-    print("Loading checkpoint '{}'".format(checkpoint_path))
+    print("loading checkpoint '{}'".format(checkpoint_path))
     checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
     model.load_state_dict(checkpoint_dict['state_dict'])
     optimizer.load_state_dict(checkpoint_dict['optimizer'])
     learning_rate = checkpoint_dict['learning_rate']
     iteration = checkpoint_dict['iteration']
-    print("Loaded checkpoint '{}' from iteration {}" .format(
+    print("loaded checkpoint '{}' from iteration {}" .format(
         checkpoint_path, iteration))
     return model, optimizer, learning_rate, iteration
 
 
 def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
-    print("Saving model and optimizer state at iteration {} to {}".format(
+    print("saving model and optimizer state at iteration {} to {}".format(
         iteration, filepath))
     torch.save({'iteration': iteration,
                 'state_dict': model.state_dict(),
@@ -142,8 +150,15 @@ def validate(model, criterion, valset, iteration, batch_size, n_gpus,
 
     model.train()
     if rank == 0:
-        print("Validation loss {}: {:9f}  ".format(iteration, val_loss))
+        print("validation loss {}: {:9f}  ".format(iteration, val_loss))
         logger.log_validation(val_loss, model, y, y_pred, iteration)
+
+        # plot_something_to_ipython
+        # https://github.com/NVIDIA/tacotron2/blob/master/logger.py
+        _, _, _, alignments = y_pred
+        from random import randint
+        idx = randint(0, alignments.size(0)-1)
+        plot_something_to_ipython(alignments[idx].data.cpu().numpy().T)
 
 
 def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
@@ -152,6 +167,7 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
 
     Params
     ------
+    print("starting with {} learning rate".format(learning_rate))
     output_directory (string): directory to save checkpoints
     log_directory (string) directory to save tensorboard logs
     checkpoint_path(string): checkpoint path
@@ -204,8 +220,9 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
     is_overflow = False
     # ================ MAIN TRAINNIG LOOP! ===================
     for epoch in range(epoch_offset, hparams.epochs):
-        print("Epoch: {}".format(epoch))
-        for i, batch in enumerate(train_loader):
+        print("starting epoch {} at iteration {}".format(epoch, iteration))
+        epochstart = time.perf_counter()
+        for i, batch in tqdm(enumerate(train_loader)):
             start = time.perf_counter()
             for param_group in optimizer.param_groups:
                 param_group['lr'] = learning_rate
@@ -237,24 +254,29 @@ def train(output_directory, log_directory, checkpoint_path, warm_start, n_gpus,
 
             if not is_overflow and rank == 0:
                 duration = time.perf_counter() - start
-                print("Train loss {} {:.6f} Grad Norm {:.6f} {:.2f}s/it".format(
-                    iteration, reduced_loss, grad_norm, duration))
+                #print("Train loss {} {:.6f} Grad Norm {:.6f} {:.2f}s/it".format(
+                #    iteration, reduced_loss, grad_norm, duration))
                 logger.log_training(
                     reduced_loss, grad_norm, learning_rate, duration, iteration)
+            from random import random
 
             if not is_overflow:
                 if (iteration % hparams.iters_per_validate == 0):
                     validate(model, criterion, valset, iteration,
                              hparams.batch_size, n_gpus, collate_fn, logger,
+        if not is_overflow and (random() > 0.66): #(iteration % hparams.iters_per_checkpoint == 0):
                              hparams.distributed_run, rank)
                 if rank == 0 and (iteration % hparams.iters_per_checkpoint == 0):
                     checkpoint_path = os.path.join(
-                        output_directory, "checkpoint_{}".format(iteration))
-                    save_checkpoint(model, optimizer, learning_rate, iteration,
-                                    checkpoint_path)
-
-            iteration += 1
-
+                        output_directory, hparams.model_name)
+                    try:
+                        save_checkpoint(model, optimizer, learning_rate, iteration,
+                                        checkpoint_path)
+                    except KeyboardInterrupt:
+                        print("you probably shouldnt ^C while im saving")
+                        save_checkpoint(model, optimizer, learning_rate, iteration,
+                                        checkpoint_path)
+                        print("ok it should be fine now")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
